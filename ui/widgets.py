@@ -1,24 +1,167 @@
 # ui/widgets.py
 
-from PySide6.QtWidgets import (QWidget, QTextEdit, QComboBox, QLineEdit, 
-                               QStackedLayout, QToolButton, QHBoxLayout)
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtWidgets import (QWidget, QPlainTextEdit, QTextBrowser, QComboBox, 
+                               QLineEdit, QStackedLayout, QToolButton, QHBoxLayout, 
+                               QVBoxLayout, QSplitter, QPushButton, QLabel)
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import (QKeyEvent, QPixmap, QPainter, QColor, 
                            QPen, QIcon, QPainterPath, QFont)
 
-from ui.styles import COLORS
+try:
+    import markdown
+    HAS_MARKDOWN = True
+except ImportError:
+    HAS_MARKDOWN = False
 
-class NoteEditor(QTextEdit):
+from ui.styles import COLORS
+from ui.highlighter import MarkdownHighlighter
+
+class NoteEditor(QWidget):
+    """
+    [重构] 支持 Markdown 实时预览和高亮的编辑器组件
+    结构：Toolbar + (Editor | Preview) Splitter
+    """
     save_signal = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setPlaceholderText("在此输入笔记内容 (支持 Markdown)...")
-        self.setAcceptRichText(False)
-    def keyPressEvent(self, event: QKeyEvent):
-        if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Return:
-            self.save_signal.emit()
+        
+        # 布局
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(5)
+
+        # --- 1. 工具栏 (包含预览开关) ---
+        tools_layout = QHBoxLayout()
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.preview_btn = QPushButton("👁️ 预览")
+        self.preview_btn.setCheckable(True)
+        self.preview_btn.setChecked(True) # 默认开启预览
+        self.preview_btn.setCursor(Qt.PointingHandCursor)
+        self.preview_btn.setFixedSize(60, 24)
+        self.preview_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['input_bg']}; color: {COLORS['placeholder']}; 
+                border: 1px solid {COLORS['border']}; border-radius: 4px; font-size: 12px;
+            }}
+            QPushButton:checked {{
+                background: {COLORS['accent']}; color: #202124; border: 1px solid {COLORS['accent']}; font-weight: bold;
+            }}
+        """)
+        self.preview_btn.toggled.connect(self.toggle_preview)
+        
+        tools_layout.addStretch()
+        tools_layout.addWidget(self.preview_btn)
+        self.layout.addLayout(tools_layout)
+
+        # --- 2. 分割器 (Splitter) ---
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setHandleWidth(2) # 拖拽条宽度
+        # 设置分割条样式
+        self.splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background-color: {COLORS['border']};
+            }}
+        """)
+
+        # --- 左侧：纯文本编辑器 ---
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText("在此输入 Markdown 内容...")
+        self.editor.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {COLORS['input_bg']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 10px;
+                color: {COLORS['text']};
+                font-family: "Consolas", "Microsoft YaHei", monospace;
+                font-size: 14px;
+            }}
+            QPlainTextEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
+        """)
+        # 绑定高亮器
+        self.highlighter = MarkdownHighlighter(self.editor.document())
+        # 拦截快捷键
+        self.editor.installEventFilter(self)
+        
+        # --- 右侧：HTML 预览器 ---
+        self.preview = QTextBrowser()
+        self.preview.setOpenExternalLinks(True)
+        self.preview.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {COLORS['background']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 10px;
+                color: {COLORS['text']};
+            }}
+        """)
+
+        self.splitter.addWidget(self.editor)
+        self.splitter.addWidget(self.preview)
+        
+        # 设置默认比例 1:1
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        
+        self.layout.addWidget(self.splitter)
+
+        # --- 3. 防抖定时器 ---
+        self.render_timer = QTimer()
+        self.render_timer.setSingleShot(True) # 只触发一次
+        self.render_timer.setInterval(500)    # 500ms 延迟
+        self.render_timer.timeout.connect(self.render_markdown)
+        
+        # 监听输入变化
+        self.editor.textChanged.connect(self.on_text_changed)
+
+    def on_text_changed(self):
+        # 每次输入重置定时器，实现防抖
+        self.render_timer.start()
+
+    def render_markdown(self):
+        """将 Markdown 转为 HTML 显示在预览区"""
+        text = self.editor.toPlainText()
+        if HAS_MARKDOWN:
+            html = markdown.markdown(text, extensions=['fenced_code', 'nl2br', 'tables'])
+            # 简单的 CSS 修复
+            html = f"<style>code {{ background-color: #3A3B3E; padding: 2px; border-radius: 3px; }}</style>{html}"
+            self.preview.setHtml(html)
         else:
-            super().keyPressEvent(event)
+            self.preview.setPlainText(text)
+
+    def toggle_preview(self, checked):
+        self.preview.setVisible(checked)
+
+    # --- 兼容旧接口 ---
+    
+    def toPlainText(self) -> str:
+        return self.editor.toPlainText()
+
+    def setPlainText(self, text: str):
+        self.editor.setPlainText(text)
+        # 手动触发一次渲染，不用等待
+        self.render_markdown()
+
+    def setPlaceholderText(self, text: str):
+        self.editor.setPlaceholderText(text)
+
+    def setReadOnly(self, ro: bool):
+        self.editor.setReadOnly(ro)
+
+    def textCursor(self):
+        return self.editor.textCursor()
+
+    def setTextCursor(self, cursor):
+        self.editor.setTextCursor(cursor)
+
+    def eventFilter(self, obj, event):
+        if obj == self.editor and event.type() == QKeyEvent.KeyPress:
+            if (event.modifiers() & Qt.ControlModifier) and event.key() == Qt.Key_Return:
+                self.save_signal.emit()
+                return True
+        return super().eventFilter(obj, event)
 
 class TagSelector(QWidget):
     # 增加一个信号，当下拉框选中项改变时发射 (用于续写模式联动)

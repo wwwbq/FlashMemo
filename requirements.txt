@@ -4,3 +4,4 @@ pynput
 pyperclip
 markdown
 openai
+mistletoe

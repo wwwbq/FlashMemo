@@ -20,7 +20,6 @@ EDGE_BOTTOM = 0x8
 class FlashMemoWindow(QWidget):
     save_requested_signal = Signal(Note)
     update_requested_signal = Signal(Note)
-    SIDEBAR_WIDTH = 320 
 
     def __init__(self, manager, prompts_dir: str):
         super().__init__()
@@ -33,12 +32,14 @@ class FlashMemoWindow(QWidget):
         self._resize_start_pos = None   
         self.resize_margin = 10 
         
+        # AI 状态
         self.raw_content = ""      
         self.is_refined_mode = False 
         self.ai_worker = None
         self.ai_cache = {} 
         self.current_prompt = ""
 
+        # 续写模式状态
         self.is_append_mode = False
         self.current_editing_note_id = None 
         
@@ -51,10 +52,10 @@ class FlashMemoWindow(QWidget):
         self.setMouseTracking(True)
 
     def init_window_properties(self):
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint )  # 去掉Qt.Tool, 避免mac上点击其他内容窗口会消失 | Qt.Tool)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(600, 550)
-        self.setMinimumSize(400, 350)
+        self.resize(800, 600)
+        self.setMinimumSize(500, 400)
 
     def setup_ui(self):
         self.root_layout = QHBoxLayout(self)
@@ -201,6 +202,8 @@ class FlashMemoWindow(QWidget):
         
         self.content_layout.addLayout(footer_layout)
 
+    # --- 续写模式逻辑 ---
+
     def toggle_append_mode(self, checked):
         self.is_append_mode = checked
         if checked:
@@ -210,8 +213,11 @@ class FlashMemoWindow(QWidget):
             self.editor.setPlaceholderText("请先选择标签和笔记...")
             self.editor.setReadOnly(True)
             self.title_edit.clear()
-            self.title_edit.setPlaceholderText("选择笔记后显示标题...")
-            self.title_edit.setReadOnly(True) 
+            
+            # [修改] 允许编辑标题
+            self.title_edit.setPlaceholderText("选择笔记后显示标题 (可修改重命名)...")
+            self.title_edit.setReadOnly(False) 
+            
             self.file_selector.show()
             self.tag_selector.force_combo_selection()
         else:
@@ -220,6 +226,7 @@ class FlashMemoWindow(QWidget):
             self.editor.setReadOnly(False)
             self.editor.setPlaceholderText("在此输入笔记内容 (支持 Markdown)...")
             self.editor.setPlainText(self.raw_content)
+            
             self.title_edit.setReadOnly(False)
             self.title_edit.clear()
             self.title_edit.setPlaceholderText("输入标题 (选填，留空自动生成)...")
@@ -249,7 +256,6 @@ class FlashMemoWindow(QWidget):
         self.current_editing_note_id = note_id
         tag = self.tag_selector.get_current_tags()[0]
         
-        # [核心修复] 立即更新标题，给予用户即时反馈
         current_file_name = self.file_selector.currentText()
         self.title_edit.setText(current_file_name)
         
@@ -265,6 +271,18 @@ class FlashMemoWindow(QWidget):
         if error or not note:
             self.status_label.setText(f"❌ Load Failed: {error}")
             return
+        
+        display_title = note.title
+        if not display_title:
+            display_title = note.metadata.get('title', '')
+        if not display_title:
+            display_title = note.metadata.get('filename', '')
+        
+        # 填充标题，但因为 title_edit 现在可编辑，
+        # 用户可能想在加载后立刻改名，所以这一步只作为初始值
+        if display_title and display_title != "Loading..." and display_title.strip():
+             self.title_edit.setText(display_title)
+        
         self.status_label.setText(f"Loaded.")
         self.editor.setPlainText(note.content)
         self.editor.setReadOnly(False)
@@ -272,22 +290,78 @@ class FlashMemoWindow(QWidget):
         cursor.movePosition(cursor.MoveOperation.End)
         self.editor.setTextCursor(cursor)
 
-    # ... (其他方法如 AI, 拖拽等保持不变，直接复制即可) ...
+    # --- 基础逻辑 (Show & Save) ---
+
+    def show_and_capture(self):
+        self.sidebar.hide()
+        if self.width() > 700: self.resize(600, self.height())
+        self.is_refined_mode = False
+        self.ai_cache = {} 
+        self.current_prompt = ""
+        self.ai_btn.setText("✨ 润色")
+        self.ai_btn.setChecked(False)
+        self.update_ai_btn_style(False)
+        if self.is_append_mode:
+            self.append_switch.setChecked(False)
+        self.title_edit.clear()
+        self.title_edit.setPlaceholderText("输入标题 (选填，留空自动生成)...")
+        self.title_edit.setReadOnly(False)
+        all_tags = self.manager.get_all_tags()
+        self.tag_selector.refresh_tags(all_tags)
+        self.status_label.setText("Processing...")
+        QApplication.processEvents() 
+        payload = self.manager.source.fetch()
+        if payload and payload.source_text:
+            self.editor.setPlainText(payload.source_text)
+            self.raw_content = payload.source_text 
+            cursor = self.editor.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.editor.setTextCursor(cursor)
+            origin = payload.origin_info.get('from', 'Unknown')
+            self.status_label.setText(f"Captured from {origin}")
+        else:
+            self.editor.setPlainText("")
+            self.raw_content = ""
+            self.status_label.setText("Clipboard is empty")
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+        self.editor.setFocus()
+
+    def request_save(self):
+        content = self.editor.toPlainText().strip()
+        if not content:
+            self.status_label.setText("⚠️ Content is empty!")
+            return
+        tags = self.tag_selector.get_current_tags()
+        if not tags: tags = ["uncategorized"]
+        title = self.title_edit.text().strip()
+        note = Note(content=content, tags=tags, title=title, type=NoteType.TEXT)
+        if self.is_append_mode and self.current_editing_note_id:
+            note.id = self.current_editing_note_id
+            self.update_requested_signal.emit(note)
+        else:
+            self.save_requested_signal.emit(note)
+        self.close_window()
+
+    def close_window(self):
+        self.save_btn.setText("保存笔记")
+        self.save_btn.setStyleSheet("")
+        self.hide()
+
     def toggle_sidebar(self):
         if self.is_refined_mode:
             self.undo_refinement()
             return
-        
-        width_delta = self.SIDEBAR_WIDTH
+        SIDEBAR_WIDTH = 320 
         current_geo = self.geometry()
-        
         if self.sidebar.isVisible():
             self.sidebar.hide()
-            self.resize(current_geo.width() - width_delta, current_geo.height())
+            self.resize(current_geo.width() - SIDEBAR_WIDTH, current_geo.height())
             self.ai_btn.setChecked(False) 
             self.update_ai_btn_style(False)
         else:
-            self.resize(current_geo.width() + width_delta, current_geo.height())
+            self.resize(current_geo.width() + SIDEBAR_WIDTH, current_geo.height())
             self.sidebar.show()
             self.sidebar.refresh_prompts()
             self.ai_btn.setChecked(True) 
@@ -332,7 +406,7 @@ class FlashMemoWindow(QWidget):
             if self.sidebar.isVisible():
                 self.sidebar.hide()
                 geo = self.geometry()
-                self.resize(geo.width() - self.SIDEBAR_WIDTH, geo.height())
+                self.resize(geo.width() - 320, geo.height())
         else:
             if self.editor.toPlainText() == "": self.editor.setPlainText(self.raw_content)
             self.status_label.setText(f"❌ {result}")
@@ -344,63 +418,6 @@ class FlashMemoWindow(QWidget):
         self.ai_btn.setChecked(False)
         self.update_ai_btn_style(False)
         self.status_label.setText("Restored original")
-
-    def show_and_capture(self):
-        self.sidebar.hide()
-        if self.width() > 650: self.resize(600, self.height())
-        self.is_refined_mode = False
-        self.ai_cache = {} 
-        self.current_prompt = ""
-        self.ai_btn.setText("✨ 润色")
-        self.ai_btn.setChecked(False)
-        self.update_ai_btn_style(False)
-        if self.is_append_mode:
-            self.append_switch.setChecked(False)
-        self.title_edit.clear()
-        self.title_edit.setPlaceholderText("输入标题 (选填，留空自动生成)...")
-        self.title_edit.setReadOnly(False)
-        all_tags = self.manager.get_all_tags()
-        self.tag_selector.refresh_tags(all_tags)
-        self.status_label.setText("Processing...")
-        QApplication.processEvents() 
-        payload = self.manager.source.fetch()
-        if payload and payload.source_text:
-            self.editor.setMarkdown(payload.source_text)
-            self.raw_content = payload.source_text 
-            cursor = self.editor.textCursor()
-            cursor.movePosition(cursor.MoveOperation.End)
-            self.editor.setTextCursor(cursor)
-            origin = payload.origin_info.get('from', 'Unknown')
-            self.status_label.setText(f"Captured from {origin}")
-        else:
-            self.editor.setPlainText("")
-            self.raw_content = ""
-            self.status_label.setText("Clipboard is empty")
-        self.showNormal()
-        self.activateWindow()
-        self.raise_()
-        self.editor.setFocus()
-
-    def request_save(self):
-        content = self.editor.toPlainText().strip()
-        if not content:
-            self.status_label.setText("⚠️ Content is empty!")
-            return
-        tags = self.tag_selector.get_current_tags()
-        if not tags: tags = ["uncategorized"]
-        title = self.title_edit.text().strip()
-        note = Note(content=content, tags=tags, title=title, type=NoteType.TEXT)
-        if self.is_append_mode and self.current_editing_note_id:
-            note.id = self.current_editing_note_id
-            self.update_requested_signal.emit(note)
-        else:
-            self.save_requested_signal.emit(note)
-        self.close_window()
-
-    def close_window(self):
-        self.save_btn.setText("保存笔记")
-        self.save_btn.setStyleSheet("")
-        self.hide()
 
     def _calc_edge(self, pos: QPoint) -> int:
         edge = EDGE_NONE
